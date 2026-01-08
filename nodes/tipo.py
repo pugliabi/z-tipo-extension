@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 import folder_paths
-from comfy.cli_args import args
 
 from ..tipo_installer import install_tipo_kgen, install_llama_cpp
 
@@ -167,11 +166,8 @@ def apply_strength(tag_map, strength_map, strength_map_nl):
                     part = part.replace("(", "\(").replace(")", "\)")
                     new_prompt += f"({part}:{strength})"
                 new_prompt += org_prompt
-            else:
-                # Fix: ensure fallback if new_prompt is not constructed
-                tag_map[cate] = tag_map[cate]
+            tag_map[cate] = new_prompt
             continue
-
         for org_tag in tag_map[cate]:
             tag = org_tag.replace("(", "\(").replace(")", "\)")
             if org_tag in strength_map:
@@ -225,7 +221,7 @@ class TIPO:
                 ["very_short", "short", "long", "very_long"],
                 {"default": "long"},
             ),
-            "seed": ("INT", {"default": 1234}),
+            "seed": ("INT", {"default": 1234, "min": -1, "max": 0xffffffffffffffff}),
             "device": (["cpu", "cuda"], {"default": "cuda"}),
         },
     }
@@ -270,12 +266,7 @@ class TIPO:
             else:
                 target = tipo_model
                 gguf = False
-            if gguf:
-                extra = {"main_device": args.cuda_device or 0}
-            else:
-                extra = {}
-                device = f"{torch.device.type}:{args.cuda_device or 0}"
-            models.load_model(target, gguf, device=device, **extra)
+            models.load_model(target, gguf, device=device)
             current_model = (tipo_model, device)
         aspect_ratio = width / height
         prompt_without_extranet = tags
