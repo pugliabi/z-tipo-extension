@@ -6,30 +6,25 @@ import os
 import json
 import pathlib
 import random
-import ast
 from functools import lru_cache
 
 import torch
 import gradio as gr
 
-import modules.ui as ui
 import modules.scripts as scripts
-from modules import devices, shared, options, infotext_utils
+from modules import devices, shared, options
 from modules.scripts import basedir, OnComponent
 from modules.processing import (
     StableDiffusionProcessingTxt2Img,
     StableDiffusionProcessingImg2Img,
-    fix_seed,
 )
 from modules.prompt_parser import parse_prompt_attention
 from modules.extra_networks import parse_prompt
 from modules.shared import opts
-from modules.ui_components import ToolButton
 
-# Try to import InputAccordion (WebUI >= 1.7)
-try:
+if hasattr(opts, "hypertile_enable_unet"):  # webui >= 1.7
     from modules.ui_components import InputAccordion
-except ImportError:
+else:
     InputAccordion = None
 
 import kgen.models as models
@@ -118,14 +113,14 @@ def apply_strength(tag_map, strength_map, strength_map_nl, break_map):
                 new_prompt = ""
                 for part, strength in strength_map_nl:
                     before, org_prompt = org_prompt.split(part, 1)
-                    new_prompt += before.replace("(", "\\(").replace(")", "\\)")
-                    part = part.replace("(", "\\(").replace(")", "\\)")
+                    new_prompt += before.replace("(", "\(").replace(")", "\)")
+                    part = part.replace("(", "\(").replace(")", "\)")
                     new_prompt += f"({part}:{strength})"
                 new_prompt += org_prompt
             tag_map[cate] = new_prompt
             continue
         for org_tag in tag_map[cate]:
-            tag = org_tag.replace("(", "\\(").replace(")", "\\)")
+            tag = org_tag.replace("(", "\(").replace(")", "\)")
             if org_tag in strength_map:
                 new_list.append(f"({tag}:{strength_map[org_tag]})")
             else:
@@ -140,142 +135,63 @@ def apply_strength(tag_map, strength_map, strength_map_nl, break_map):
 class TIPOScript(scripts.Script):
     def __init__(self):
         super().__init__()
-        self.prompt_area = [None, None, None, None]
-        self.tag_prompt_area = [None, None]
-        self.prompt_area_row = [None, None]
-        self.tipo_accordion_row = [None, None]
         self.current_model = None
-        self.generation_info = [None, None]  # For txt2img and img2img
-        self.seed_reuse_btn = [None, None]  # Store reuse buttons
-        self.seed_num_input = [None, None]  # Store seed inputs
-        self.on_after_component_elem_id = [
-            ("txt2img_prompt_row", lambda x: self.create_new_prompt_area(0, x)),
-            ("txt2img_prompt", lambda x: self.set_prompt_area(0, x)),
-            ("img2img_prompt_row", lambda x: self.create_new_prompt_area(1, x)),
-            ("img2img_prompt", lambda x: self.set_prompt_area(1, x)),
-            ("generation_info_txt2img", lambda x: self.set_generation_info(0, x)),
-            ("generation_info_img2img", lambda x: self.set_generation_info(1, x)),
-        ]
-
-    def create_new_prompt_area(self, i2i: int, prompt_row: OnComponent):
-        # Create first row: Tag Prompt and Natural Language Prompt in 2 columns
-        with gr.Row(visible=not opts.tipo_no_extra_input):
-            with gr.Column(scale=1):
-                new_tag_prompt_area = gr.Textbox(
-                    label="Tag Prompt",
-                    lines=3,
-                    placeholder="Tag Prompt for TIPO (Put Tags to Prompt region)",
-                )
-            with gr.Column(scale=1):
-                new_prompt_area = gr.Textbox(
-                    label="Natural Language Prompt",
-                    lines=3,
-                    placeholder="Natural Language Prompt for TIPO (Put Tags to Prompt region)",
-                )
-
-        # Create second row: Generate Prompt button (below the two input areas)
-        self.prompt_area_row[i2i] = gr.Row()
-        # Create third row: TIPO accordion
-        self.tipo_accordion_row[i2i] = gr.Row()
-
-        self.tag_prompt_area[i2i] = new_tag_prompt_area
-        self.prompt_area[i2i * 2 + 1] = new_prompt_area
-
-    def set_prompt_area(self, i2i: int, component: OnComponent):
-        self.prompt_area[i2i * 2] = component.component
-
-    def set_generation_info(self, i2i: int, component: OnComponent):
-        """Store generation_info component reference and connect reuse seed button"""
-        self.generation_info[i2i] = component.component
-
-        # Connect reuse seed button if both components are available
-        if self.seed_reuse_btn[i2i] is not None and self.seed_num_input[i2i] is not None:
-            self.connect_reuse_seed_button(i2i)
-
-    def connect_reuse_seed_button(self, i2i: int):
-        """Connect the reuse seed button to retrieve TIPO seed from generation info"""
-        if self.generation_info[i2i] is None:
-            return
-
-        self.seed_reuse_btn[i2i].click(
-            fn=self.get_tipo_seed_from_generation_info,
-            _js="(x, y) => [x, selected_gallery_index()]",
-            show_progress=False,
-            inputs=[self.generation_info[i2i]],
-            outputs=[self.seed_num_input[i2i]],
-        )
 
     def title(self):
         return "TIPO"
 
-    def show(self, _):
+    def show(self, is_img2img):
+        # Return scripts.AlwaysVisible to show in both txt2img and img2img tabs
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with self.prompt_area_row[is_img2img]:
-            with gr.Column(
-                scale=1, min_width=180, visible=not opts.tipo_no_extra_input
-            ):
-                prompt_gen = gr.Button(value="Generate Prompt")
-            with gr.Column(scale=6):
-                # Create accordion with enable checkbox on the label
-                tab_name = 'img2img' if is_img2img else 'txt2img'
-
-                if InputAccordion is not None:
-                    # WebUI >= 1.7: Use InputAccordion (checkbox on accordion label)
-                    tipo_acc = InputAccordion(
-                        value=False,
-                        label=self.title(),
-                        elem_id=f"{tab_name}_tipo_accordion",
-                        visible=True,
+        # Create standalone accordion interface that doesn't interfere with prompt area
+        with (
+            InputAccordion(False, open=False, label=self.title())
+            if InputAccordion
+            else gr.Accordion(open=False, label=self.title())
+        ) as tipo_acc:
+            with gr.Row():
+                with gr.Column():
+                    # Input fields for TIPO
+                    tag_prompt_area = gr.Textbox(
+                        label="Tag Prompt",
+                        lines=3,
+                        placeholder="Enter tags for TIPO processing (e.g., 1girl, blue hair, school uniform)",
+                        value="",
                     )
-                    enabled_check = tipo_acc
-                else:
-                    # WebUI < 1.7: Use regular Accordion
-                    tipo_acc = gr.Accordion(
-                        open=False,
-                        label=self.title(),
-                        elem_id=f"{tab_name}_tipo_accordion"
+                    nl_prompt_area = gr.Textbox(
+                        label="Natural Language Prompt",
+                        lines=3,
+                        placeholder="Enter natural language description (optional)",
+                        value="",
                     )
-                    enabled_check = None  # Will be created inside
-
-                with tipo_acc:
-                    # For older WebUI versions, add enable checkbox inside
-                    if InputAccordion is None:
-                        enabled_check = gr.Checkbox(
-                            label="Enabled",
-                            value=False,
-                            elem_id=f"{tab_name}_tipo_enabled",
-                        )
-
+                    
+                    # Generate button
                     with gr.Row():
-                        with gr.Column():
-                            with gr.Row():
-                                with gr.Column(scale=1):
-                                    read_orig_prompt_btn = gr.Button(
-                                        size="sm",
-                                        value="Apply original prompt",
-                                        visible=False,
-                                        min_width=20,
-                                    )
-                                with gr.Column(scale=3):
-                                    orig_prompt_area = gr.TextArea(visible=False)
-                                    orig_prompt_light = gr.HTML("")
-                                orig_prompt_area.change(
-                                    lambda x: PROMPT_INDICATE_HTML * bool(x),
-                                    inputs=orig_prompt_area,
-                                    outputs=orig_prompt_light,
+                        get_current_prompt = gr.Button(value="Use Current Prompt", variant="secondary")
+                        prompt_gen = gr.Button(value="Generate Enhanced Prompt", variant="primary")
+                    
+                    with gr.Row():
+                        copy_prompt_info = gr.Markdown("💡 **Tip:** Use the copy button above to copy the generated prompt, then paste it into the main prompt box.")
+                    
+                    # Output area
+                    generated_prompt = gr.Textbox(
+                        label="Generated Prompt",
+                        lines=5,
+                        max_lines=10,
+                        show_copy_button=True,
+                        interactive=True,
+                    )
+                    
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            if InputAccordion is None:
+                                enabled_check = gr.Checkbox(
+                                    label="Auto-apply during generation", value=False
                                 )
-                                orig_prompt_area.change(
-                                    lambda x: gr.update(visible=bool(x)),
-                                    inputs=orig_prompt_area,
-                                    outputs=read_orig_prompt_btn,
-                                )
-                                read_orig_prompt_btn.click(
-                                    fn=lambda x: x,
-                                    inputs=[orig_prompt_area],
-                                    outputs=self.prompt_area[is_img2img],
-                                )
+                            else:
+                                enabled_check = tipo_acc
 
                             tag_length_radio = gr.Radio(
                                 label="Tags Length target",
@@ -319,35 +235,25 @@ class TIPOScript(scripts.Script):
                             )
 
                             with gr.Group():
-                                with gr.Row(elem_classes=["form"]):
+                                with gr.Row():
                                     seed_num_input = gr.Number(
                                         label="Seed for upsampling tags",
                                         minimum=-1,
+                                        maximum=2**31 - 1,
                                         step=1,
                                         scale=4,
                                         value=-1,
                                     )
-                                    seed_random_btn = ToolButton(value=ui.random_symbol)
-                                    seed_reuse_btn = ToolButton(value=ui.reuse_symbol)
-                                    seed_shuffle_btn = gr.Button(value="Shuffle", size="sm", scale=0)
-
-                                    # Store references for later connection
-                                    self.seed_num_input[is_img2img] = seed_num_input
-                                    self.seed_reuse_btn[is_img2img] = seed_reuse_btn
+                                    seed_random_btn = gr.Button(value="Randomize")
+                                    seed_shuffle_btn = gr.Button(value="Shuffle")
 
                                     seed_random_btn.click(
                                         lambda: -1, outputs=[seed_num_input]
                                     )
-                                    # Reuse button will be connected in set_generation_info
-                                    # when generation_info component becomes available
                                     seed_shuffle_btn.click(
                                         lambda: random.randint(0, 2**31 - 1),
                                         outputs=[seed_num_input],
                                     )
-
-                                    # Try to connect now if generation_info is already available
-                                    if self.generation_info[is_img2img] is not None:
-                                        self.connect_reuse_seed_button(is_img2img)
 
                             with gr.Group():
                                 process_timing_dropdown = gr.Dropdown(
@@ -406,11 +312,12 @@ class TIPOScript(scripts.Script):
 
         aspect_ratio_place_holder = gr.Number(value=1.0, visible=False)
 
+        # Generate enhanced prompt
         prompt_gen.click(
             self.prompt_gen_only,
             inputs=[
-                self.tag_prompt_area[is_img2img],
-                self.prompt_area[is_img2img * 2 + 1],
+                tag_prompt_area,
+                nl_prompt_area,
                 aspect_ratio_place_holder,
                 seed_num_input,
                 tag_length_radio,
@@ -424,11 +331,17 @@ class TIPOScript(scripts.Script):
                 model_dropdown,
                 gguf_use_cpu,
                 no_formatting,
-                self.tag_prompt_area[is_img2img],
+                tag_prompt_area,
             ],
             outputs=[
-                self.prompt_area[is_img2img * 2],
+                generated_prompt,
             ],
+        )
+        
+        # Get current prompt button - user can manually copy from main prompt
+        get_current_prompt.click(
+            fn=lambda: "Manually copy your prompt from the main prompt box above and paste it here.",
+            outputs=[tag_prompt_area],
         )
 
         self.infotext_fields = [
@@ -437,15 +350,8 @@ class TIPOScript(scripts.Script):
                 if InputAccordion
                 else (tipo_acc, lambda d: gr.update(open=INFOTEXT_KEY in d))
             ),
-            (
-                self.prompt_area[is_img2img * 2],
-                lambda d: d.get(INFOTEXT_KEY_PROMPT, d["Prompt"]),
-            ),
-            (
-                self.prompt_area[is_img2img * 2 + 1],
-                lambda d: d.get(INFOTEXT_NL_PROMPT, ""),
-            ),
-            (orig_prompt_area, lambda d: d["Prompt"]),
+            (tag_prompt_area, lambda d: d.get("TIPO Tags", "")),
+            (nl_prompt_area, lambda d: d.get(INFOTEXT_NL_PROMPT, "")),
             (enabled_check, lambda d: INFOTEXT_KEY in d),
             (seed_num_input, lambda d: self.get_infotext(d, "seed", None)),
             (tag_length_radio, lambda d: self.get_infotext(d, "tag_length", None)),
@@ -485,61 +391,9 @@ class TIPOScript(scripts.Script):
             model_dropdown,
             gguf_use_cpu,
             no_formatting,
-            self.tag_prompt_area[is_img2img],
-            self.prompt_area[is_img2img * 2 + 1],
+            tag_prompt_area,
+            nl_prompt_area,
         ]
-
-    def get_tipo_seed_from_generation_info(self, gen_info_string: str, index: int = 0):
-        """
-        Retrieves TIPO seed from generation_info JSON data.
-        For batch generation, retrieves the seed for the selected image using the index.
-
-        Args:
-            gen_info_string: JSON string of generation_info
-            index: Gallery index (default: 0) - which image in batch to get seed from
-
-        Returns:
-            int: TIPO seed value, or -1 if not found or on error
-        """
-        res = -1
-        try:
-            gen_info = json.loads(gen_info_string)
-
-            # Get infotext for the specific image index
-            infotexts = gen_info.get("infotexts", [])
-            if index < len(infotexts):
-                infotext = infotexts[index]
-
-                # Parse generation parameters from infotext
-                gen_parameters = infotext_utils.parse_generation_parameters(infotext, [])
-
-                # Get TIPO Parameters string from parsed parameters
-                tipo_params_str = gen_parameters.get("TIPO Parameters", "")
-
-                if tipo_params_str:
-                    # Convert JavaScript boolean literals to Python
-                    dict_string = tipo_params_str.replace('false', 'False').replace('true', 'True')
-
-                    # Parse as dictionary
-                    tipo_params = ast.literal_eval(dict_string)
-
-                    # Get seed value
-                    res = int(tipo_params.get('seed', -1))
-            else:
-                # Fallback to extra_generation_params if index is out of range
-                extra_params = gen_info.get("extra_generation_params", {})
-                tipo_params_str = extra_params.get("TIPO Parameters", "")
-
-                if tipo_params_str:
-                    dict_string = tipo_params_str.replace('false', 'False').replace('true', 'True')
-                    tipo_params = ast.literal_eval(dict_string)
-                    res = int(tipo_params.get('seed', -1))
-
-        except Exception as e:
-            if gen_info_string:
-                logger.warning(f"Error retrieving TIPO seed from generation info: {e}")
-
-        return res
 
     def get_infotext(self, d, target, default):
         return d.get(INFOTEXT_KEY, {}).get(target, default)
@@ -649,7 +503,6 @@ class TIPOScript(scripts.Script):
         if seed == -1:
             seed = random.randrange(4294967294)
         self.write_infotext(p, p.prompt, "BEFORE", seed, *args)
-        fix_seed(p)
         seed = int(seed + p.seed)
 
         args = list(args)
@@ -784,11 +637,7 @@ class TIPOScript(scripts.Script):
                 addon["tags"].append(tag)
         addon = apply_strength(addon, strength_map, strength_map_nl, break_map)
         unformatted_prompt_by_tipo = (
-            prompt_without_extranet
-            + ", "
-            + ", ".join(addon["tags"])
-            + "\n"
-            + addon["nl"]
+            prompt + ", " + ", ".join(addon["tags"]) + "\n" + addon["nl"]
         )
         tag_map = apply_strength(tag_map, strength_map, strength_map_nl, break_map)
         formatted_prompt_by_tipo = apply_format(tag_map, format).replace(
@@ -814,19 +663,4 @@ def parse_infotext(_, params):
 
 scripts.script_callbacks.on_infotext_pasted(parse_infotext)
 
-options.categories.register_category("prompt_gen", "Prompt Gen")
-shared.options_templates.update(
-    shared.options_section(
-        ("TIPO", "TIPO", "prompt_gen"),
-        {
-            "tipo_no_extra_input": shared.OptionInfo(
-                False,
-                (
-                    "Disable extra input for TIPO"
-                    ", Natural Language Prompt and Tag Prompt will be hidden."
-                    " (UI Reload Needed)"
-                ),
-            ),
-        },
-    )
-)
+# No longer need extra input options since we're using a standalone UI
