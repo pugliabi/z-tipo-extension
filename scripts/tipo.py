@@ -3,6 +3,8 @@ import scripts
 print(scripts, scripts.__file__, dir(scripts))
 
 import os
+import re
+import ast
 import json
 import pathlib
 import random
@@ -12,11 +14,14 @@ import torch
 import gradio as gr
 
 import modules.scripts as scripts
+import modules.ui as ui
 from modules import devices, shared, options
 from modules.scripts import basedir, OnComponent
+from modules.ui_components import ToolButton
 from modules.processing import (
     StableDiffusionProcessingTxt2Img,
     StableDiffusionProcessingImg2Img,
+    fix_seed,
 )
 from modules.prompt_parser import parse_prompt_attention
 from modules.extra_networks import parse_prompt
@@ -136,6 +141,9 @@ class TIPOScript(scripts.Script):
     def __init__(self):
         super().__init__()
         self.current_model = None
+        self.generation_info = [None, None]  # For txt2img and img2img
+        self.seed_num_input = [None, None]
+        self.seed_reuse_btn = [None, None]
 
     def title(self):
         return "TIPO"
@@ -235,7 +243,7 @@ class TIPOScript(scripts.Script):
                             )
 
                             with gr.Group():
-                                with gr.Row():
+                                with gr.Row(elem_classes=["form"]):
                                     seed_num_input = gr.Number(
                                         label="Seed for upsampling tags",
                                         minimum=-1,
@@ -244,8 +252,13 @@ class TIPOScript(scripts.Script):
                                         scale=4,
                                         value=-1,
                                     )
-                                    seed_random_btn = gr.Button(value="Randomize")
-                                    seed_shuffle_btn = gr.Button(value="Shuffle")
+                                    seed_random_btn = ToolButton(value=ui.random_symbol)
+                                    seed_reuse_btn = ToolButton(value=ui.reuse_symbol)
+                                    seed_shuffle_btn = gr.Button(value="Shuffle", size="sm", scale=0)
+
+                                    # Store references for seed reuse
+                                    self.seed_num_input[is_img2img] = seed_num_input
+                                    self.seed_reuse_btn[is_img2img] = seed_reuse_btn
 
                                     seed_random_btn.click(
                                         lambda: -1, outputs=[seed_num_input]
@@ -503,6 +516,7 @@ class TIPOScript(scripts.Script):
         if seed == -1:
             seed = random.randrange(4294967294)
         self.write_infotext(p, p.prompt, "BEFORE", seed, *args)
+        fix_seed(p)
         seed = int(seed + p.seed)
 
         args = list(args)
@@ -515,6 +529,36 @@ class TIPOScript(scripts.Script):
             seed = random.randrange(2**31 - 1)
             args[3] = seed
         return self._process(*args)
+
+    def get_tipo_seed_from_generation_info(self, gen_info_string: str, index: int = 0):
+        """
+        Retrieves TIPO seed from generation_info JSON data.
+        For batch generation, retrieves the seed for the selected image using the index.
+        """
+        try:
+            if not gen_info_string:
+                return gr.update()
+
+            # Parse JSON array of generation info
+            gen_info_list = ast.literal_eval(gen_info_string) if gen_info_string.startswith('[') else [gen_info_string]
+
+            if index >= len(gen_info_list):
+                index = 0
+
+            gen_info = gen_info_list[index] if isinstance(gen_info_list, list) else gen_info_string
+
+            # Look for TIPO Parameters in the info
+            if INFOTEXT_KEY not in str(gen_info):
+                return gr.update()
+
+            # Extract seed from TIPO parameters
+            match = re.search(r'"seed":\s*(\d+)', str(gen_info))
+            if match:
+                return int(match.group(1))
+
+            return gr.update()
+        except Exception:
+            return gr.update()
 
     def _process(
         self,
@@ -663,4 +707,35 @@ def parse_infotext(_, params):
 
 scripts.script_callbacks.on_infotext_pasted(parse_infotext)
 
-# No longer need extra input options since we're using a standalone UI
+
+def on_after_component(component, **kwargs):
+    """Connect seed reuse button to generation_info component for retrieving TIPO seed."""
+    elem_id = kwargs.get("elem_id", "")
+    if elem_id == "generation_info_txt2img":
+        # Find the TIPOScript instance and connect
+        for script in scripts.scripts_txt2img.alwayson_scripts:
+            if isinstance(script, TIPOScript):
+                script.generation_info[0] = component
+                if script.seed_reuse_btn[0] and script.seed_num_input[0]:
+                    script.seed_reuse_btn[0].click(
+                        fn=script.get_tipo_seed_from_generation_info,
+                        _js="(x, y) => [x, selected_gallery_index()]",
+                        show_progress=False,
+                        inputs=[component],
+                        outputs=[script.seed_num_input[0]],
+                    )
+    elif elem_id == "generation_info_img2img":
+        for script in scripts.scripts_img2img.alwayson_scripts:
+            if isinstance(script, TIPOScript):
+                script.generation_info[1] = component
+                if script.seed_reuse_btn[1] and script.seed_num_input[1]:
+                    script.seed_reuse_btn[1].click(
+                        fn=script.get_tipo_seed_from_generation_info,
+                        _js="(x, y) => [x, selected_gallery_index()]",
+                        show_progress=False,
+                        inputs=[component],
+                        outputs=[script.seed_num_input[1]],
+                    )
+
+
+scripts.script_callbacks.on_after_component(on_after_component)
